@@ -115,6 +115,9 @@ class IPWebcamCapture:
                 print(f"Failed to open video source: {url}")
                 return False
             
+            # Set buffer to minimal BEFORE first read to reduce latency
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            
             # Test if we can read a frame
             ret, frame = self.cap.read()
             if not ret:
@@ -123,6 +126,7 @@ class IPWebcamCapture:
                     self.cap.release()
                     new_url = url.rstrip('/') + '/video'
                     self.cap = cv2.VideoCapture(new_url, cv2.CAP_FFMPEG)
+                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                     ret, frame = self.cap.read()
                     if ret:
                         print(f"Connected to {new_url}")
@@ -133,8 +137,6 @@ class IPWebcamCapture:
                 else:
                     return False
                 
-            # Set buffer to minimal to reduce latency
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             self._running = True
             print(f"Successfully connected to camera")
             return True
@@ -144,14 +146,25 @@ class IPWebcamCapture:
             return False
     
     def read_frame(self) -> Optional[np.ndarray]:
-        """Read a frame from the webcam."""
+        """Read the latest frame from the webcam, draining stale buffered frames."""
         if not self.cap or not self._running:
             return None
         
         with self._lock:
+            # Drain any stale frames sitting in the buffer so we always get
+            # the most recent frame (key latency reduction for IP cameras).
             ret, frame = self.cap.read()
             if not ret:
                 return None
+            # Grab extra frames non-blocking to flush the buffer
+            for _ in range(2):
+                grabbed = self.cap.grab()
+                if grabbed:
+                    ret2, newer = self.cap.retrieve()
+                    if ret2:
+                        frame = newer
+                else:
+                    break
             return frame
     
     def release(self):
@@ -867,8 +880,8 @@ async def websocket_stream(websocket: WebSocket, room_id: str):
     # Performance: process every frame but skip heavy ops periodically
     frame_counter = 0
     APPLIANCE_SUBMIT_EVERY = 5
-    DETECTION_SKIP = 3  # Skip YOLO every N frames
-    JPEG_QUALITY = 50   # Lower for faster encoding
+    DETECTION_SKIP = 4  # Run YOLO every 4th frame to free CPU faster
+    JPEG_QUALITY = 40   # Lower quality = smaller payload = less latency
     
     # Cached state for skipping heavy processing
     cached_person_count = 0
@@ -1238,11 +1251,12 @@ async def websocket_stream(websocket: WebSocket, room_id: str):
                     x = int(c * cell_w)
                     cv2.line(display_frame, (x, 0), (x, h_mz), grid_color, 1)
 
-            # Resize for display - smaller for faster transmission
+            # Resize for display - smaller for faster transmission (480px wide)
             h_disp, w_disp = display_frame.shape[:2]
-            if w_disp > 640:
-                display_frame = cv2.resize(display_frame, (640, int(h_disp * 640 / w_disp)))
-                raw_frame = cv2.resize(raw_frame, (640, int(h_disp * 640 / w_disp)))
+            TARGET_W = 480
+            if w_disp > TARGET_W:
+                display_frame = cv2.resize(display_frame, (TARGET_W, int(h_disp * TARGET_W / w_disp)))
+                raw_frame = cv2.resize(raw_frame, (TARGET_W, int(h_disp * TARGET_W / w_disp)))
 
             # Encode with lower quality for speed
             _, buffer = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])

@@ -33,11 +33,21 @@ export default function MonitorTab({
           <span className={`v-alert ${room.roomStatus}`}>{room.roomStatus === 'waste' ? '!!! WASTE_DETECTED !!!' : 'SECURE'}</span>
         </div>
         <div className="video-frame">
-          {room.frame || demoMode ? (
-            <img src={showRaw && room.rawFrame ? room.rawFrame : room.frame} alt={`${title} feed`} className="pixel-stream" />
-          ) : (
-            <div className="placeholder">OFFLINE</div>
-          )}
+          {/* Frames are painted directly to the DOM via ref — no React re-render per frame */}
+          <img
+            ref={showRaw ? room.rawImgRef : room.imgRef}
+            alt={`${title} feed`}
+            className="pixel-stream"
+            decoding="async"
+            style={{ display: room.hasFrame || demoMode ? 'block' : 'none' }}
+          />
+          {/* Also keep the non-shown img mounted so its ref is always attached */}
+          <img
+            ref={showRaw ? room.imgRef : room.rawImgRef}
+            alt=""
+            style={{ display: 'none' }}
+          />
+          {!room.hasFrame && !demoMode && <div className="placeholder">OFFLINE</div>}
           <div className="scanline" />
           <div className="corner tl" /><div className="corner tr" />
           <div className="corner bl" /><div className="corner br" />

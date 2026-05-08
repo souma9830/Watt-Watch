@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { API_URL, WS_URL } from '../config'
 
 export default function useRoom(roomId, defaultUrl) {
@@ -6,8 +6,12 @@ export default function useRoom(roomId, defaultUrl) {
   const [connected, setConnected] = useState(false)
   const [connecting, setConnecting] = useState(false)
   const [fps, setFps] = useState(0)
-  const [frame, setFrame] = useState(null)
-  const [rawFrame, setRawFrame] = useState(null)
+  
+  // Direct DOM ref for the <img> element — frame is painted without React re-render
+  const imgRef = useRef(null)
+  const rawImgRef = useRef(null)
+  // Keep last frame src accessible for initial render / fallback
+  const frameSrcRef = useRef(null)
   
   const [personCount, setPersonCount] = useState(0)
   const [lightStatus, setLightStatus] = useState('OFF')
@@ -16,11 +20,14 @@ export default function useRoom(roomId, defaultUrl) {
   const [roomStatus, setRoomStatus] = useState('secure')
   const [processingTime, setProcessingTime] = useState(0)
   const [avgBrightness, setAvgBrightness] = useState(0)
+  const [hasFrame, setHasFrame] = useState(false)
   
   const [microzoneData, setMicrozoneData] = useState(null)
   
   const wsRef = useRef(null)
   const fpsCounter = useRef({ count: 0, lastTime: Date.now() })
+  // Throttle metadata state updates to ~10 per second to reduce re-renders
+  const metaThrottle = useRef(0)
   
   const connect = async () => {
     setConnecting(true)
@@ -36,34 +43,50 @@ export default function useRoom(roomId, defaultUrl) {
       setConnecting(false)
       const ws = new WebSocket(`${WS_URL}/ws/stream/${roomId}`)
       wsRef.current = ws
+      ws.binaryType = 'arraybuffer' // no effect here but ensures WS is in optimal mode
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data)
-          if (data.frame) setFrame(data.frame)
-          if (data.raw_frame) setRawFrame(data.raw_frame)
-          setPersonCount(data.person_count)
-          setLightStatus(data.light_status)
-          setFanStatus(data.fan_status)
-          setMonitorStatus(data.monitor_status || 'OFF')
-          
-          if (data.processing_time_ms !== undefined) {
-            const serverTime = data.timestamp * 1000
-            const now = Date.now()
-            const realLatency = Math.max(0, now - serverTime)
-            setProcessingTime(realLatency)
+
+          // === ZERO-LATENCY FRAME PAINT: bypass React state entirely ===
+          if (data.frame) {
+            frameSrcRef.current = data.frame
+            if (imgRef.current) {
+              imgRef.current.src = data.frame
+            }
+            if (!hasFrame) setHasFrame(true)
           }
-          if (data.avg_brightness !== undefined) setAvgBrightness(data.avg_brightness)
-          if (data.microzone) setMicrozoneData(data.microzone)
-          
-          const isWaste = data.person_count === 0 && (data.light_status === 'ON' || data.fan_status === 'ON' || data.monitor_status === 'ON')
-          setRoomStatus(isWaste ? 'waste' : 'secure')
-          
+          if (data.raw_frame && rawImgRef.current) {
+            rawImgRef.current.src = data.raw_frame
+          }
+
+          // === FPS counter (no state, just ref) ===
           fpsCounter.current.count++
-          const now = Date.now()
-          if (now - fpsCounter.current.lastTime >= 1000) {
+          const nowMs = Date.now()
+          if (nowMs - fpsCounter.current.lastTime >= 1000) {
             setFps(fpsCounter.current.count)
             fpsCounter.current.count = 0
-            fpsCounter.current.lastTime = now
+            fpsCounter.current.lastTime = nowMs
+          }
+
+          // === Throttled metadata updates (every ~100ms) ===
+          if (nowMs - metaThrottle.current >= 100) {
+            metaThrottle.current = nowMs
+            setPersonCount(data.person_count)
+            setLightStatus(data.light_status)
+            setFanStatus(data.fan_status)
+            setMonitorStatus(data.monitor_status || 'OFF')
+            if (data.avg_brightness !== undefined) setAvgBrightness(data.avg_brightness)
+            if (data.microzone) setMicrozoneData(data.microzone)
+            if (data.processing_time_ms !== undefined) {
+              const serverTime = data.timestamp * 1000
+              const realLatency = Math.max(0, nowMs - serverTime)
+              setProcessingTime(realLatency)
+            }
+            const isWaste = data.person_count === 0 && (
+              data.light_status === 'ON' || data.fan_status === 'ON' || data.monitor_status === 'ON'
+            )
+            setRoomStatus(isWaste ? 'waste' : 'secure')
           }
         } catch (err) {}
       }
@@ -81,7 +104,9 @@ export default function useRoom(roomId, defaultUrl) {
       }) 
     } catch (e) {}
     setConnected(false)
-    setFrame(null)
+    setHasFrame(false)
+    frameSrcRef.current = null
+    if (imgRef.current) imgRef.current.src = ''
   }
 
   useEffect(() => {
@@ -91,7 +116,8 @@ export default function useRoom(roomId, defaultUrl) {
   }, [])
 
   return {
-    roomId, url, setUrl, connected, connecting, fps, frame, rawFrame,
+    roomId, url, setUrl, connected, connecting, fps,
+    imgRef, rawImgRef, frameSrcRef, hasFrame,
     personCount, lightStatus, fanStatus, monitorStatus, roomStatus, setRoomStatus, 
     processingTime, avgBrightness, microzoneData, connect, disconnect
   }
