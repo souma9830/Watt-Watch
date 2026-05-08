@@ -35,8 +35,16 @@ import uuid
 
 # Import enums from src so comparisons work correctly
 from src.appliance_status import ApplianceType, Status
-from src.database import get_database
+from src.database import get_database, get_mongo
 from src.mqtt_manager import MQTTManager
+
+# ByteTrack persistent tracking
+try:
+    from src.tracking import ByteTracker, EntryExitMonitor, EntryExitEvent
+    TRACKING_AVAILABLE = True
+except ImportError as _tracking_err:
+    print(f"[Tracking] ByteTracker import failed: {_tracking_err}")
+    TRACKING_AVAILABLE = False
 
 
 @dataclass
@@ -197,7 +205,39 @@ class MultiRoomDetector:
         self.mqtt_mgr.connect()
         self._room_buffers = {} # room_id -> int (consecutive empty frames)
         self._buffer_threshold = 30 # ~1 second at 30fps
-        
+
+        # ---- ByteTrack: one tracker per room ----
+        self._trackers: Dict[str, Any] = {}
+        self._entry_exit_monitors: Dict[str, Any] = {}
+        if TRACKING_AVAILABLE:
+            tracking_cfg = config.get("tracking", {})
+            ee_cfg = tracking_cfg.get("entry_exit", {})
+            for room_id in self._rooms:
+                self._trackers[room_id] = ByteTracker(
+                    track_buffer=tracking_cfg.get("track_buffer", 30),
+                    match_threshold=tracking_cfg.get("match_threshold", 0.8),
+                    high_threshold=tracking_cfg.get("high_threshold", 0.6),
+                    low_threshold=tracking_cfg.get("low_threshold", 0.1),
+                    min_box_area=tracking_cfg.get("min_box_area", 100.0),
+                )
+                snapshot_dir = os.path.join(
+                    root_dir, ee_cfg.get("snapshot_dir", "data/entry_exit_snapshots")
+                )
+                self._entry_exit_monitors[room_id] = EntryExitMonitor(
+                    line_ratio=ee_cfg.get("line_ratio", 0.5),
+                    min_crossing_frames=ee_cfg.get("min_crossing_frames", 2),
+                    cooldown_seconds=ee_cfg.get("cooldown_seconds", 3.0),
+                    snapshot_dir=snapshot_dir if ee_cfg.get("enabled", True) else None,
+                )
+            print(f"[Tracker] ByteTrack initialized for {len(self._rooms)} rooms")
+        else:
+            print("[Tracker] ByteTrack unavailable — using person count only")
+
+        # MongoDB (optional)
+        self._mongo = get_mongo()
+        self._tracking_log_buffer: List[Dict[str, Any]] = []
+        self._tracking_log_lock = threading.Lock()
+
         # Microzone intelligence
         from src.microzone import MicrozoneTracker
         mz_config = config.get("microzone", {})
@@ -1011,20 +1051,128 @@ async def websocket_stream(websocket: WebSocket, room_id: str):
                 cv2.putText(display_frame, "LOW_LIGHT: THERMAL_MODE ACTIVE", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
-            # --- Draw People (Purple) ---
-            if detections:
+            # ======================================================
+            # ByteTrack: Persistent ID tracking + Entry/Exit
+            # ======================================================
+            tracked_persons = []
+            entry_exit_events_this_frame = []
+
+            if detector and TRACKING_AVAILABLE and room_id in detector._trackers:
+                tracker = detector._trackers[room_id]
+                ee_monitor = detector._entry_exit_monitors[room_id]
+
+                # Run ByteTracker on current raw detections
+                active_tracks = tracker.update(detections)
+                tracked_persons = [t.to_dict() for t in active_tracks]
+
+                # Use tracked count as the authoritative person count
+                person_count = len(active_tracks)
+
+                # Update room with tracked count
+                room = detector._rooms.get(room_id)
+                if room:
+                    room.person_count = person_count
+
+                # Run entry/exit monitor
+                fh, fw = display_frame.shape[:2]
+                entry_exit_events_this_frame = ee_monitor.update(
+                    tracks=active_tracks,
+                    frame_height=fh,
+                    frame_width=fw,
+                    frame_number=frame_counter,
+                    camera_id=room_id,
+                    frame=display_frame if ee_monitor.snapshot_dir else None,
+                )
+
+                # Log entry/exit events to MongoDB
+                if entry_exit_events_this_frame and detector._mongo:
+                    for ev in entry_exit_events_this_frame:
+                        detector._mongo.log_entry_exit(ev.to_dict())
+                        print(f"[Tracking] {ev.event_type} | person_id={ev.person_id} | room={room_id}")
+
+                # Buffer tracking logs for batch MongoDB write (every 30 frames)
+                if detector._mongo and active_tracks:
+                    with detector._tracking_log_lock:
+                        for t in active_tracks:
+                            detector._tracking_log_buffer.append({
+                                "person_id": t.track_id,
+                                "camera_id": room_id,
+                                "bbox": [float(x) for x in t.bbox_xyxy],
+                                "centroid": [float(t.mean[0]), float(t.mean[1])],
+                                "confidence": float(t.score),
+                                "frame_number": frame_counter,
+                                "timestamp": time.time(),
+                                "tracklet_len": t.tracklet_len,
+                            })
+                        if len(detector._tracking_log_buffer) >= 30:
+                            buf = detector._tracking_log_buffer[:]
+                            detector._tracking_log_buffer.clear()
+                            try:
+                                detector._mongo.log_tracking_batch(buf)
+                            except Exception:
+                                pass
+
+            # --- Draw Virtual Line ---
+            if detector and TRACKING_AVAILABLE and room_id in detector._entry_exit_monitors:
+                detector._entry_exit_monitors[room_id].draw_line(
+                    display_frame, color=(0, 255, 255), thickness=2, label="ENTRY/EXIT"
+                )
+                # Flash overlay for entry/exit events
+                if entry_exit_events_this_frame:
+                    detector._entry_exit_monitors[room_id].draw_events_flash(
+                        display_frame, entry_exit_events_this_frame
+                    )
+
+            # --- Draw Tracked Persons (ID-labeled boxes + trails) ---
+            if tracked_persons:
+                # Palette: cycle through distinct colors by ID
+                palette = [
+                    (255, 80, 80), (80, 255, 80), (80, 80, 255),
+                    (255, 200, 0), (0, 200, 255), (255, 0, 200),
+                    (0, 255, 200), (200, 0, 255), (200, 255, 0),
+                ]
+                for tp in tracked_persons:
+                    bbox = tp.get("bbox", [])
+                    tid = tp.get("id", 0)
+                    conf = tp.get("confidence", 0)
+                    trail = tp.get("trail", [])
+                    color = palette[tid % len(palette)]
+
+                    if len(bbox) == 4:
+                        x1, y1, x2, y2 = map(int, bbox)
+
+                        # Draw trail lines
+                        if len(trail) > 1:
+                            for pi in range(1, len(trail)):
+                                pt1 = (int(trail[pi - 1][0]), int(trail[pi - 1][1]))
+                                pt2 = (int(trail[pi][0]), int(trail[pi][1]))
+                                alpha = pi / len(trail)
+                                t_color = tuple(int(c * alpha) for c in color)
+                                cv2.line(display_frame, pt1, pt2, t_color, 1)
+
+                        # Draw bounding box
+                        cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+
+                        # Draw ID label
+                        lbl = f"ID:{tid}"
+                        (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                        cv2.rectangle(display_frame, (x1, y1 - 22), (x1 + tw + 6, y1), color, -1)
+                        cv2.putText(display_frame, lbl, (x1 + 3, y1 - 5),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+            elif detections:
+                # Fallback: draw plain boxes if tracker not available
                 for det in detections:
                     bbox = det.get("bbox", [])
                     if len(bbox) == 4:
                         x1, y1, x2, y2 = map(int, bbox)
-                        color = (255, 0, 255) # Purple/Magenta
+                        color = (255, 0, 255)
                         cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
-                        
                         lbl = "person"
                         (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
                         cv2.rectangle(display_frame, (x1, y1 - 20), (x1 + tw + 4, y1), color, -1)
-                        cv2.putText(display_frame, lbl, (x1 + 2, y1 - 5), 
+                        cv2.putText(display_frame, lbl, (x1 + 2, y1 - 5),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
+
 
             # --- Draw Appliances (Light: Yellow, Fan: Cyan) ---
             if detector:
@@ -1116,6 +1264,19 @@ async def websocket_stream(websocket: WebSocket, room_id: str):
                 "timestamp": time.time(),
                 "person_count": person_count,
                 "detections": detections,
+                # ByteTrack tracking data
+                "tracked_persons": tracked_persons,
+                "entry_exit_events": [
+                    {
+                        "person_id": ev.person_id,
+                        "event_type": ev.event_type,
+                        "timestamp": ev.timestamp,
+                        "confidence": ev.confidence,
+                    }
+                    for ev in entry_exit_events_this_frame
+                ],
+                "active_track_count": len(tracked_persons),
+                # Appliance & energy
                 "light_status": light_status,
                 "fan_status": fan_status,
                 "monitor_status": monitor_status,
@@ -1143,7 +1304,66 @@ async def websocket_stream(websocket: WebSocket, room_id: str):
             pass
 
 
-@app.websocket("/ws/detections")
+
+@app.get("/api/tracking/status")
+async def get_tracking_status():
+    """Get ByteTracker status for all rooms."""
+    if not app_state["detector"] or not TRACKING_AVAILABLE:
+        return {"tracking_available": TRACKING_AVAILABLE, "rooms": {}}
+
+    detector = app_state["detector"]
+    rooms = {}
+    for room_id, tracker in detector._trackers.items():
+        rooms[room_id] = {
+            "active_tracks": tracker.active_count,
+            "total_tracks_created": tracker.frame_id,
+            "frame_id": tracker.frame_id,
+        }
+
+    return {
+        "tracking_available": TRACKING_AVAILABLE,
+        "rooms": rooms,
+    }
+
+
+@app.get("/api/tracking/entry-exit")
+async def get_entry_exit_events(room_id: Optional[str] = None, limit: int = 50):
+    """Get recent entry/exit events from MongoDB (if available)."""
+    mongo = get_mongo()
+    if mongo and mongo.is_connected:
+        events = mongo.get_entry_exit_events(camera_id=room_id, limit=limit)
+        return {"source": "mongodb", "events": events, "count": len(events)}
+
+    return {
+        "source": "none",
+        "events": [],
+        "count": 0,
+        "message": "MongoDB not configured. Set MONGO_URI in .env to enable persistent storage."
+    }
+
+
+@app.get("/api/tracking/mongodb-stats")
+async def get_mongodb_stats():
+    """Get MongoDB collection statistics."""
+    mongo = get_mongo()
+    if mongo and mongo.is_connected:
+        counts = mongo.get_collection_counts()
+        return {"connected": True, "collections": counts}
+    return {"connected": False, "message": "MongoDB not configured or unavailable"}
+
+
+@app.post("/api/tracking/reset/{room_id}")
+async def reset_tracker(room_id: str):
+    """Reset ByteTracker for a specific room (clears all track IDs)."""
+    if not app_state["detector"] or not TRACKING_AVAILABLE:
+        raise HTTPException(status_code=400, detail="Tracker not available")
+    detector = app_state["detector"]
+    if room_id not in detector._trackers:
+        raise HTTPException(status_code=404, detail=f"Room '{room_id}' not found")
+    detector._trackers[room_id].reset()
+    return {"status": "reset", "room_id": room_id}
+
+
 async def websocket_detections(websocket: WebSocket):
     """WebSocket endpoint for detection data only (no video)."""
     await websocket.accept()

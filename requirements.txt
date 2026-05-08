@@ -18,3 +18,5 @@ websockets>=12.0
 aiortc>=1.9.0
 av>=12.0.0
 python-dotenv>=1.0.0
+pymongo>=4.6.0
+scipy>=1.11.0
