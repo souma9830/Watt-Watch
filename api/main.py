@@ -4,6 +4,8 @@ Connects to IP webcam and provides real-time detection results via WebSocket.
 Supports privacy-first ghost mode for face anonymization.
 """
 
+
+
 import asyncio
 import cv2
 import numpy as np
